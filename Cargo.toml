@@ -1,0 +1,27 @@
+[package]
+name = "binhex"
+version = "0.1.0"
+edition = "2018"
+authors = [
+	"Eric Wolf <robo-eric@gmx.de>"
+]
+description = "support for the BinHex 4 file format"
+readme = "README.md"
+repository = "https://github.com/Deric-W/binhex"
+license = "GPL-3.0-only"
+keywords = [
+	"binhex",
+	"encode",
+	"decode",
+	"compression"
+]
+categories = [
+	"encoding",
+	"parser-implementations",
+	"compression"
+]
+
+[lib]
+name = "binhex"
+path = "src/lib.rs"
+crate-type = ["lib"]
