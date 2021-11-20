@@ -1,7 +1,95 @@
+//! Utilities for reading RLE compressed files
+
 use std::default::Default;
 use std::slice;
 use std::io::{Read, ErrorKind, Result as IoResult};
-use crate::rle::{RunState, RUN_DELIMITER};
+use crate::rle::RUN_DELIMITER;
+
+/// State of a RLE run
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum RunState {
+    /// nothing was read
+    BEFORE,
+
+    /// the byte to be expanded was read
+    DELIMITER(u8),
+
+    /// the delimiter between the byte and the length was read
+    LENGTH(u8),
+
+    /// byte, delimiter and length where read, run complete
+    IN(u8, u8)
+}
+
+impl RunState {
+    /// construct an instance dependig of the success of a full run write
+    /// 
+    /// # Arguments
+    /// 
+    /// * `byte` - the byte which the run expands
+    /// * `count` - the length of the run
+    /// * `buf` - buffer in which the run is to be expanded
+    /// 
+    /// # Return Value
+    /// A tuple containing the number of bytes written and the resulting run state
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use binhex::rle::read::RunState;
+    /// 
+    /// let mut buffer: [u8; 3] = [0; 3];
+    /// 
+    /// // buffer too small, state is not being reset
+    /// assert_eq!(RunState::from_write(0x41, 3, &mut buffer[..1]), (1, RunState::IN(0x41, 2)));
+    /// assert_eq!(&buffer, &[0x41, 0, 0]);
+    /// 
+    /// // all bytes fit in the buffer, the state is being reset
+    /// assert_eq!(RunState::from_write(0x41, 3, &mut buffer), (3, RunState::BEFORE));
+    /// assert_eq!(&buffer, &[0x41, 0x41, 0x41]);
+    /// 
+    /// // runs with a length of 0 are escaped delimiters
+    /// assert_eq!(RunState::from_write(0xff, 0, &mut buffer), (1, RunState::DELIMITER(0x90)));
+    /// assert_eq!(&buffer, &[0xff, 0x41, 0x41]);
+    /// ```
+	pub fn from_write(byte: u8, count: u8, buf: &mut [u8]) -> (usize, Self) {
+		match buf {
+			// no write = no state change
+			[] => (0, Self::IN(byte, count)),
+
+			// case for escaped delimiter
+			[ref mut first, ..] if count == 0 => {
+				*first = byte;
+				(1, Self::DELIMITER(RUN_DELIMITER))
+			},
+
+			// base case for rle run
+			_ => {
+				let length: usize = count.into();
+				match length.checked_sub(buf.len()) {
+					// run fits in buffer
+					Some(0) | None => {
+						buf[..length].fill(byte);
+						(length, Self::BEFORE)
+					},
+
+					// run does not fit in buffer
+					Some(x) => {
+						buf.fill(byte);
+						(buf.len(), Self::IN(byte, x as u8))
+					}
+				}
+			}
+		}
+	}
+}
+
+impl Default for RunState {
+	fn default() -> Self {
+		Self::BEFORE
+	}
+}
+
 
 /// Implementation of [`std::io::Read`] which transparently decompresses data from an underlying reader.
 /// 
@@ -17,7 +105,7 @@ use crate::rle::{RunState, RUN_DELIMITER};
 /// 
 /// ```
 /// use std::io::{Read, Result, ErrorKind};
-/// use binhex::rle::RleDecoder;
+/// use binhex::rle::read::RleDecoder;
 /// 
 /// let mut buffer = Vec::with_capacity(6);
 /// RleDecoder::new(&[1u8, 2u8, 0x90u8, 2u8, 3u8][..]).read_to_end(&mut buffer).unwrap();
@@ -34,7 +122,7 @@ use crate::rle::{RunState, RUN_DELIMITER};
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct RleDecoder<R> {
 
-    /// underlying reader providing data for decompression#
+    /// underlying reader providing data for decompression
     inner: R,
 
     /// current state of the reader
@@ -48,7 +136,7 @@ impl<R> RleDecoder<R> {
     /// 
     /// ```
     /// use std::io::empty;
-    /// use binhex::rle::RleDecoder;
+    /// use binhex::rle::read::RleDecoder;
     /// 
     /// let decoder = RleDecoder::new(empty());
     /// ``` 
@@ -62,7 +150,7 @@ impl<R> RleDecoder<R> {
     /// 
     /// ```
     /// use std::io::empty;
-    /// use binhex::rle::{RunState, RleDecoder};
+    /// use binhex::rle::read::{RunState, RleDecoder};
     /// 
     /// let decoder = RleDecoder::with_state(RunState::BEFORE, empty());
     /// ```
@@ -76,7 +164,7 @@ impl<R> RleDecoder<R> {
     /// 
     /// ```
     /// use std::io::empty;
-    /// use binhex::rle::{RunState, RleDecoder};
+    /// use binhex::rle::read::{RunState, RleDecoder};
     /// 
     /// // maybe some data was already read from the reader
     /// let decoder = RleDecoder::with_state(RunState::IN(0x41, 4), empty());
@@ -94,7 +182,7 @@ impl<R> RleDecoder<R> {
     /// 
     /// ```
     /// use std::io::{empty, Empty};
-    /// use binhex::rle::RleDecoder;
+    /// use binhex::rle::read::RleDecoder;
     /// 
     /// let decoder = RleDecoder::new(empty());
     /// let reader: &Empty = decoder.get_ref();
@@ -111,7 +199,7 @@ impl<R> RleDecoder<R> {
     /// 
     /// ```
     /// use std::io::{empty, Empty};
-    /// use binhex::rle::RleDecoder;
+    /// use binhex::rle::read::RleDecoder;
     /// 
     /// let mut decoder = RleDecoder::new(empty());
     /// let mut reader: &mut Empty = decoder.get_mut();
@@ -122,11 +210,12 @@ impl<R> RleDecoder<R> {
 
     /// Unwrap this `RleDecoder<R>` and return the underlying reader.
     /// 
+    /// Note that data stored in the current state is lost.
     /// # Examples
     /// 
     /// ```
     /// use std::io::{empty, Empty};
-    /// use binhex::rle::RleDecoder;
+    /// use binhex::rle::read::RleDecoder;
     /// 
     /// let decoder = RleDecoder::new(empty());
     /// let reader: Empty = decoder.into_inner();
@@ -157,24 +246,26 @@ impl<R: Read> RleDecoder<R> {
         length
     }
 
+    /// Handle reading beginning with the length.
+    fn read_length(&mut self, byte: u8, buf: &mut [u8]) -> IoResult<usize> {
+        self.read_byte()
+            .unwrap_or(Err(ErrorKind::UnexpectedEof.into()))
+            .map(|count| self.update_from_write(byte, count, buf))
+    }
+
     /// Handle reading beginning with the delimiter.
-    /// 
-    /// If this method returns `None` then the buffer was too small to handle all possibilities and nothing was read.
-    fn read_delimiter(&mut self, byte: u8, buf: &mut [u8]) -> Option<IoResult<usize>> {
+    fn read_delimiter(&mut self, byte: u8, buf: &mut [u8]) -> IoResult<usize> {
         if buf.is_empty() {
             // dont read if the buf cant handle the possible byte
-            None
+            Ok(0)
         } else {
             match self.read_byte() {
                 // try to complete the run
-                Some(Ok(RUN_DELIMITER)) => match self.read_byte().unwrap_or(Err(ErrorKind::UnexpectedEof.into())) {
-                    Ok(count) => Ok(self.update_from_write(byte, count, buf)),
-                    Err(e)    => {
-                        // remember that we already read the delimiter
-                        self.state = RunState::LENGTH(byte);
-                        Err(e)
-                    }
-                },
+                Some(Ok(RUN_DELIMITER)) => {
+                    // remember that we already read the delimiter
+                    self.state = RunState::LENGTH(byte);
+                    self.read_length(byte, buf)
+                }
                 // byte was not part of a run
                 Some(Ok(b)) => {
                     // does not panic because the if protects against an empty buf
@@ -190,7 +281,7 @@ impl<R: Read> RleDecoder<R> {
                     self.state = RunState::BEFORE;
                     Ok(1)
                 }
-            }.into()
+            }
         }
     }
 }
@@ -199,23 +290,19 @@ impl<R: Read> Read for RleDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         match self.state {
             // return Ok(0) instead of UnexpectedEof
-            RunState::BEFORE => {
-                self.read_byte().map_or(Ok(0), |result| {
+            RunState::BEFORE => self.read_byte().map_or(Ok(0), |result| {
                     match result {
-                        Ok(byte) => self.read_delimiter(byte, buf).unwrap_or_else(
+                        Ok(byte) => {
                             // remember that we already read the first byte of the run
-                            || {self.state = RunState::DELIMITER(byte); Ok(0)}
-                        ),
+                            self.state = RunState::DELIMITER(byte);
+                            self.read_delimiter(byte, buf)
+                        },
                         Err(e)   => Err(e)
                     }
-                })
-            },
-            RunState::DELIMITER(byte) => self.read_delimiter(byte, buf).unwrap_or(Ok(0)),
-            RunState::LENGTH(byte) => {
-                self.read_byte()
-                    .ok_or(ErrorKind::UnexpectedEof)?
-                    .map(|count| self.update_from_write(byte, count, buf))
-            },
+                }
+            ),
+            RunState::DELIMITER(byte) => self.read_delimiter(byte, buf),
+            RunState::LENGTH(byte) => self.read_length(byte, buf),
             RunState::IN(byte, count) => Ok(self.update_from_write(byte, count, buf))
         }
     }
