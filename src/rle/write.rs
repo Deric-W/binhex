@@ -511,6 +511,13 @@ impl<W: Write> RleEncoder<W> {
         }
         Ok(())
     }
+
+    /// Calculate how many times `byte` appears from the start of
+    /// `buf` before it is replaced with something else or
+    /// `max` is exceeded.
+    fn count_run(byte: u8, max: usize, buf: &[u8]) -> usize {
+        buf.iter().take(max).take_while(|b| **b == byte).count()
+    }
 }
 
 impl<W: Write> Write for RleEncoder<W> {
@@ -522,19 +529,14 @@ impl<W: Write> Write for RleEncoder<W> {
             [first, ..] => match self.state {
                 // add bytes to existing accumulation
                 RunState::Accumulate(byte, count) if byte == *first && count.get() < u8::MAX => {
-                    let count = count.get()
-                        + buf
-                            .iter()
-                            .copied()
-                            // prevent overflow
-                            .take((u8::MAX - count.get()) as usize)
-                            .take_while(|byte| byte == first)
-                            .count() as u8;
-                    debug_assert_ne!(count, 0);
-                    // SAFETY: guard will never be zero since we guard against overflows
-                    self.state =
-                        RunState::Accumulate(*first, unsafe { NonZeroU8::new_unchecked(count) });
-                    Ok(count as usize)
+                    // prevent overflow on cast and addition
+                    let taken = Self::count_run(*first, (u8::MAX - count.get()).into(), buf) as u8;
+                    debug_assert_ne!(count.get() + taken, 0);
+                    // SAFETY: we guard against overflowing addition
+                    self.state = RunState::Accumulate(*first, unsafe {
+                        NonZeroU8::new_unchecked(count.get() + taken)
+                    });
+                    Ok(taken.into())
                 }
                 // flush state and create new accumulation
                 _ => {
@@ -546,18 +548,14 @@ impl<W: Write> Write for RleEncoder<W> {
                             None => return Ok(0)
                         }
                     }
-                    let count = buf
-                        .iter()
-                        .copied()
-                        // prevent overflow
-                        .take(u8::MAX as usize)
-                        .take_while(|byte| byte == first)
-                        .count() as u8;
+                    // prevent overflow on cast
+                    let count = Self::count_run(*first, u8::MAX.into(), buf) as u8;
                     debug_assert_ne!(count, 0);
                     // SAFETY: the existence of first guarantees a non zero result
-                    self.state =
-                        RunState::Accumulate(*first, unsafe { NonZeroU8::new_unchecked(count) });
-                    Ok(count as usize)
+                    self.state = RunState::Accumulate(*first, unsafe {
+                        NonZeroU8::new_unchecked(count)
+                    });
+                    Ok(count.into())
                 }
             },
         }
@@ -571,13 +569,13 @@ impl<W: Write> Write for RleEncoder<W> {
 
 impl<W: Write> Drop for RleEncoder<W> {
     /// Flushes the state on drop to prevent data loss but ignores errors while doing so
-    /// 
+    ///
     /// # Examples
-    /// 
+    ///
     /// ```
     /// use std::io::Write;
     /// use binhex::rle::write::RleEncoder;
-    /// 
+    ///
     /// // buffer cant hold any data
     /// let mut buffer: [u8; 0] = [];
     /// {
