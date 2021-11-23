@@ -1,9 +1,9 @@
 //! Utilities for reading RLE compressed files
 
 use crate::rle::RUN_DELIMITER;
-use std::default::Default;
+use core::default::Default;
+use core::slice;
 use std::io::{ErrorKind, Read, Result as IoResult};
-use std::slice;
 
 /// State of a RLE run
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]

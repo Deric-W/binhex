@@ -1,13 +1,13 @@
 //! Utilities for writing RLE compressed files
 
 use crate::rle::RUN_DELIMITER;
-use std::default::Default;
+use core::default::Default;
+use core::fmt;
+use core::iter::Iterator;
+use core::num::NonZeroU8;
+use core::{mem, ptr};
 use std::error::Error;
-use std::fmt;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
-use std::iter::Iterator;
-use std::num::NonZeroU8;
-use std::{mem, ptr};
 
 /// State of a RLE run
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
