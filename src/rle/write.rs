@@ -518,7 +518,7 @@ impl<W: Write> RleEncoder<W> {
                 .state
                 .transition(&mut self.inner)
                 // incomplete writes will be treated as errors by flush
-                .unwrap_or(Err(ErrorKind::WriteZero.into()))?
+                .unwrap_or_else(|| Err(ErrorKind::WriteZero.into()))?
         }
         Ok(())
     }

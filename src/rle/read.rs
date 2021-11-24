@@ -252,7 +252,7 @@ impl<R: Read> RleDecoder<R> {
     /// Handle reading beginning with the length.
     fn read_length(&mut self, byte: u8, buf: &mut [u8]) -> IoResult<usize> {
         self.read_byte()
-            .unwrap_or(Err(ErrorKind::UnexpectedEof.into()))
+            .unwrap_or_else(|| Err(ErrorKind::UnexpectedEof.into()))
             .map(|count| self.update_from_write(byte, count, buf))
     }
 
