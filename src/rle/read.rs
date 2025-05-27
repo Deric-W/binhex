@@ -11,184 +11,349 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::rle::RUN_DELIMITER;
+use super::RUN_DELIMITER;
+use core::cmp::min;
+use core::convert::TryInto;
 use core::default::Default;
-use core::slice;
-use std::io::{ErrorKind, Read, Result as IoResult};
+use core::num::NonZeroU8;
+use memchr::memchr;
+use std::collections::TryReserveError;
+use std::io::{BufRead, Error as IoError, ErrorKind, Read, Result as IoResult};
+use thiserror::Error;
 
-/// State of a RLE run
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
-pub enum RunState {
-    /// nothing was read
-    Before,
+/// Error produced by [`Decoder::drain`] when the internal state would require
+/// consuming more bytes.
+#[derive(Error, Debug)]
+#[error("expected byte specifying the length of a run, received eof")]
+pub struct DecoderError;
 
-    /// the byte to be expanded was read
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Default, Debug)]
+enum DecoderState {
+    /// The decoder has not read any data.
+    #[default]
+    Empty,
+
+    // A byte belonging to a possible run has been read.
+    Byte(u8),
+
+    /// A byte with a run delimiter was read.
     Delimiter(u8),
 
-    /// the delimiter between the byte and the length was read
-    Length(u8),
-
-    /// byte, delimiter and length where read, run complete
-    In(u8, u8)
+    /// A run consisting of byte, delimiter and length was read.
+    Run(u8, NonZeroU8),
 }
 
-impl RunState {
-    /// construct an instance dependig of the success of a full run write
-    ///
-    /// # Arguments
-    ///
-    /// * `byte` - the byte which the run expands
-    /// * `count` - the length of the run
-    /// * `buf` - buffer in which the run is to be expanded
-    ///
-    /// # Return Value
-    /// A tuple containing the number of bytes written and the resulting run state
-    fn from_write(byte: u8, count: u8, buf: &mut [u8]) -> (usize, Self) {
-        match buf {
-            // no write = no state change
-            [] => (0, Self::In(byte, count)),
-
-            // case for escaped delimiter
-            [ref mut first, ..] if count == 0 => {
-                *first = byte;
-                (1, Self::Delimiter(RUN_DELIMITER))
-            }
-
-            // base case for rle run
-            _ => {
-                let length: usize = count.into();
-                match length.checked_sub(buf.len()) {
-                    // run fits in buffer
-                    Some(0) | None => {
-                        buf[..length].fill(byte);
-                        (length, Self::Before)
-                    }
-
-                    // run does not fit in buffer
-                    Some(x) => {
-                        buf.fill(byte);
-                        (buf.len(), Self::In(byte, x as u8))
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Default for RunState {
-    fn default() -> Self {
-        Self::Before
-    }
-}
-
-/// Implementation of [`std::io::Read`] which transparently decompresses data from an underlying reader.
+/// Decoder of the compression used by BinHex 4.
 ///
-/// BinHex 4 files use a RLE compression described [here](https://files.stairways.com/other/binhex-40-specs-info.txt).
-/// A `RleDecoder<R>` handles decompression by applying it transparently to reads from a underlying [`std::io::Read`] instance.
+/// BinHex 4 files use a RLE compression described [here](https://files.stairways.com/other/binhex-40-specs-info.txt)
+/// which can be decoded using this type.
+/// At first the compressed input is passed to the [`Decoder::decode`] method
+/// until all has been consumed.
+/// Then [`Decoder::drain`] is called until the internal state is consumed.
+///
+/// # Incremental Decoding
+///
+/// The [`Decoder::decode`] does not require access to the whole input at once,
+/// allowing for it to be read in chunks to reduce the required memory.
 ///
 /// # Buffering
 ///
-/// A `RleDecoder<R>` performs many short reads from the underlying reader, which can cause performance problems.
-/// To prevent that, put a reader in a [`std::io::BufReader`] before wrapping it with this type.
+/// [`Decoder`] maintains an internal fixed size buffer for storing state between
+/// calls to its methods.
+/// While this buffer consists only of three bytes it may represent output up to
+/// 256 bytes long and therefore has to be consumed by calling [`Decoder::drain`]
+/// for guaranteeing a successful decoding.
+#[derive(Clone, Default, Debug)]
+pub struct Decoder {
+    state: DecoderState,
+}
+
+impl Decoder {
+    /// Creates a new `Decoder` with an initial state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use binhex::rle::Decoder;
+    ///
+    /// let decoder = Decoder::new();
+    /// ```
+    pub fn new() -> Self {
+        Decoder::default()
+    }
+
+    /// Decompress a portion of the input.
+    ///
+    /// This method is passed a portion of the input and a buffer for the decoded output.
+    /// It will fill the output buffer as much as it can and return the number of input
+    /// bytes consumed and output bytes produced.
+    ///
+    /// Should the whole decoded output not fit in the output buffer it will only consume
+    /// a part of it and expects the caller to call it again with the rest of the input
+    /// buffer (and possible more input data) until the whole input has been consumed.
+    pub fn decode(&mut self, mut input: &[u8], mut output: &mut [u8]) -> (usize, usize) {
+        let input_length = input.len();
+        let output_length = output.len();
+        loop {
+            match self.state {
+                DecoderState::Empty if input.is_empty() => break,
+                DecoderState::Empty => {
+                    self.state = DecoderState::Byte(input[0]);
+                    input = &input[1..];
+                }
+                DecoderState::Byte(byte) if !input.is_empty() && !output.is_empty() => {
+                    let (read, written) = self.read_run(byte, input, output);
+                    input = &input[read..];
+                    output = &mut output[written..];
+                }
+                DecoderState::Byte(byte) => {
+                    self.state = match input.first() {
+                        Some(&RUN_DELIMITER) => DecoderState::Delimiter(byte),
+                        _ => break,
+                    };
+                    input = &input[1..];
+                }
+                DecoderState::Delimiter(_) if input.is_empty() => break,
+                DecoderState::Delimiter(byte) => {
+                    self.state = match NonZeroU8::new(input[0]) {
+                        Some(length) => DecoderState::Run(byte, length),
+                        // a run with a length of zero is an escaped run delimiter byte
+                        None if !output.is_empty() => {
+                            output[0] = byte;
+                            output = &mut output[1..];
+                            DecoderState::Byte(RUN_DELIMITER)
+                        }
+                        None => break,
+                    };
+                    input = &input[1..];
+                }
+                DecoderState::Run(byte, length) if !output.is_empty() => {
+                    let consumed = self.consume_run(byte, length, output);
+                    output = &mut output[consumed..];
+                }
+                DecoderState::Run(_, _) => break,
+            }
+        }
+        (input_length - input.len(), output_length - output.len())
+    }
+
+    /// Finish decompressing the buffered input.
+    ///
+    /// After all input has been consumed by [`Decoder::decode`] there may be state
+    /// left in the decoder.
+    /// To inform it that the input has ended this function has to be called to produce
+    /// the rest of the decoded output until it produced zero bytes
+    /// (assuming the output buffer would be able to store more).
+    ///
+    /// Should the placement of the end violate the compression format an [`DecoderError`]
+    /// will be produced instead without changing the internal state.
+    pub fn drain(&mut self, output: &mut [u8]) -> Result<usize, DecoderError> {
+        match self.state {
+            DecoderState::Empty => Ok(0),
+            DecoderState::Byte(byte) if !output.is_empty() => {
+                output[0] = byte;
+                self.state = DecoderState::Empty;
+                Ok(1)
+            }
+            DecoderState::Byte(_) => Ok(0),
+            DecoderState::Delimiter(_) => Err(DecoderError),
+            DecoderState::Run(byte, length) => {
+                let consumed = self.consume_run(byte, length, output);
+                Ok(consumed)
+            }
+        }
+    }
+
+    /// Read the remainder of a potential run.
+    ///
+    /// Assumes the input and output are not empty.
+    fn read_run(&mut self, byte: u8, input: &[u8], output: &mut [u8]) -> (usize, usize) {
+        debug_assert!(!input.is_empty() && !output.is_empty());
+        let longest_output = min(input.len(), output.len());
+        match memchr(RUN_DELIMITER, &input[..longest_output]) {
+            Some(0) => {
+                self.state = DecoderState::Delimiter(byte);
+                (1, 0)
+            }
+            Some(index) => {
+                output[0] = byte;
+                output[1..index].copy_from_slice(&input[..index - 1]);
+                self.state = DecoderState::Delimiter(input[index - 1]);
+                (index + 1, index)
+            }
+            None => {
+                output[0] = byte;
+                output[1..longest_output].copy_from_slice(&input[..longest_output - 1]);
+                self.state = DecoderState::Byte(input[longest_output - 1]);
+                (longest_output + 1, longest_output)
+            }
+        }
+    }
+
+    /// Consume a run of compressed bytes, returning the number of bytes produced.
+    fn consume_run(&mut self, byte: u8, length: NonZeroU8, output: &mut [u8]) -> usize {
+        let consumed: u8 = min(length.get(), output.len().try_into().unwrap_or(u8::MAX));
+        output[..consumed.into()].fill(byte);
+        self.state = match NonZeroU8::new(length.get() - consumed) {
+            Some(new_length) => DecoderState::Run(byte, new_length),
+            None => DecoderState::Empty,
+        };
+        consumed.into()
+    }
+}
+
+/// Error produced by [`decode`] and [`decode_into`].
+#[derive(Error, Debug)]
+pub enum DecodeError {
+    /// The used [`Decoder`] reported an error.
+    #[error("error while decoding input data")]
+    DecoderError(#[source] DecoderError),
+
+    /// The buffer to hold the output data could not be resized
+    /// to receive additional data.
+    #[error("error while resizing the output buffer")]
+    ReserveError(#[source] TryReserveError),
+}
+
+/// Decompress some input data, returning the produced output.
 ///
-/// # Decompression
-///
-/// This type may serve reads from an in memory buffer to allow for decompression.
-/// While this does not mean that this type consumes a significant amount of memory
-/// (the run is stored as a tuple of two bytes) it means that extracting the underlying
-/// reader might lead to data loss depending on the current state of the decoder.
-///
-/// # Short reads
-///
-/// This type may frequently serve less data than requested (but never `Ok(0)`) even if
-/// more is available from the underlying reader because the [`std::io::Read::read`]
-/// method only knows success or failure and therefore has no concept for reads with an error.
-///
-/// While this is perfectly normal behavior it might confuse some bad implementations.
+/// This function uses [`Decoder`] internally and is intended
+/// to be used as a shortcut when the resulting data will fit into memory.
 ///
 /// # Examples
 ///
 /// ```
-/// use std::io::{Read, Result, ErrorKind};
-/// use binhex::rle::read::RleDecoder;
+/// use binhex::rle::{RUN_DELIMITER, decode, DecodeError};
+///
+/// // with compressed runs
+/// let output = decode(&[1u8, 2u8, RUN_DELIMITER, 2u8, 3u8]).unwrap();
+/// assert_eq!(output, [1, 2, 2, 3]);
+///
+/// // with escaped delimiters
+/// let output = decode(&[0x2Bu8, RUN_DELIMITER, 0x00u8, RUN_DELIMITER, 0x05u8]).unwrap();
+/// assert_eq!(output, [0x2Bu8, 0x90u8, 0x90u8, 0x90u8, 0x90u8, 0x90u8]);
+///
+/// // with corrupted runs
+/// let error = decode(&[0x42u8, RUN_DELIMITER]).unwrap_err();
+/// assert!(matches!(error, DecodeError::DecoderError(_)));
+/// ```
+pub fn decode(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    let mut buf = Vec::new();
+    decode_into(input, &mut buf)?;
+    Ok(buf)
+}
+
+/// Variant of [`decode`] which appends to an existing buffer.
+///
+/// # Examples
+///
+/// ```
+/// use binhex::rle::{RUN_DELIMITER, decode_into, DecodeError};
+///
+/// let mut output = vec![42];
+/// decode_into(&[1u8, 2u8, RUN_DELIMITER, 2u8, 3u8], &mut output).unwrap();
+///
+/// assert_eq!(output, [42, 1, 2, 2, 3]);
+/// ```
+pub fn decode_into(mut input: &[u8], output: &mut Vec<u8>) -> Result<(), DecodeError> {
+    let mut decoder = Decoder::new();
+    let mut final_size = output.len();
+    let mut buf: &mut [u8] = &mut [];
+    while !input.is_empty() {
+        if buf.is_empty() {
+            buf = aquire_buf(output)?;
+        }
+        let (read, written) = decoder.decode(input, buf);
+        input = &input[read..];
+        buf = &mut buf[written..];
+        final_size += written;
+    }
+    loop {
+        if buf.is_empty() {
+            buf = aquire_buf(output)?;
+        }
+        let written = decoder.drain(buf).map_err(DecodeError::DecoderError)?;
+        if written == 0 {
+            break;
+        }
+        buf = &mut buf[written..];
+        final_size += written;
+    }
+    output.truncate(final_size);
+    Ok(())
+}
+
+fn aquire_buf(output: &mut Vec<u8>) -> Result<&mut [u8], DecodeError> {
+    let old_len = output.len();
+    output.try_reserve(64).map_err(DecodeError::ReserveError)?;
+    // FIXME: use [MaybeUninit<u8>] when the required methods on slices are stabilised
+    output.resize(output.capacity(), 0);
+    Ok(&mut output[old_len..])
+}
+
+/// Wrapper which transparently applies [`Decoder`] to a [`BufRead`].
+///
+/// The internally used decoder maintains an internal state which can
+/// cause data loss when the underlying reader is extracted before
+/// everything has been read.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{Read, ErrorKind};
+/// use binhex::rle::{RUN_DELIMITER, Reader};
 ///
 /// let mut buffer = Vec::with_capacity(6);
-/// RleDecoder::new(&[1u8, 2u8, 0x90u8, 2u8, 3u8][..]).read_to_end(&mut buffer).unwrap();
+/// Reader::new(&[1u8, 2u8, RUN_DELIMITER, 2u8, 3u8][..]).read_to_end(&mut buffer).unwrap();
 /// assert_eq!(buffer, [1, 2, 2, 3]);
 ///
 /// // with escaped delimiters
 /// buffer.clear();
-/// RleDecoder::new(&[0x2Bu8, 0x90u8, 0x00u8, 0x90u8, 0x05u8][..]).read_to_end(&mut buffer).unwrap();
+/// Reader::new(&[0x2Bu8, RUN_DELIMITER, 0x00u8, RUN_DELIMITER, 0x05u8][..]).read_to_end(&mut buffer).unwrap();
 /// assert_eq!(buffer, [0x2Bu8, 0x90u8, 0x90u8, 0x90u8, 0x90u8, 0x90u8]);
 ///
 /// // with corrupted runs
-/// assert_eq!(RleDecoder::new(&[0x42u8, 0x90u8][..]).read_to_end(&mut buffer).err().unwrap().kind(), ErrorKind::UnexpectedEof);
+/// let error = Reader::new(&[0x42u8, RUN_DELIMITER][..]).read_to_end(&mut buffer).unwrap_err();
+/// assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
 /// ```
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub struct RleDecoder<R> {
-    /// underlying reader providing data for decompression
+#[derive(Clone, Debug)]
+pub struct Reader<R> {
     inner: R,
-
-    /// current state of the reader
-    state: RunState
+    decoder: Decoder,
+    eof_reached: bool,
 }
 
-impl<R> RleDecoder<R> {
-    /// Creates a new `RleDecoder<R>` with a default initial state, which is currently [`RunState::Before`].
+impl<R> Reader<R> {
+    /// Creates a new [`Reader<R>`] with a default initial state.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::io::empty;
-    /// use binhex::rle::read::RleDecoder;
+    /// use binhex::rle::Reader;
     ///
-    /// let decoder = RleDecoder::new(empty());
+    /// let decoder = Reader::new(empty());
     /// ```
-    pub fn new(inner: R) -> RleDecoder<R> {
-        RleDecoder::with_state(RunState::default(), inner)
+    pub fn new(inner: R) -> Self {
+        Reader {
+            inner,
+            decoder: Decoder::default(),
+            eof_reached: false,
+        }
     }
 
-    /// Creates a new `RleDecoder<R>` with the specified initial state.
+    /// Gets a immutable reference to the underlying reader.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::io::empty;
-    /// use binhex::rle::read::{RunState, RleDecoder};
-    ///
-    /// let decoder = RleDecoder::with_state(RunState::Before, empty());
-    /// ```
-    pub fn with_state(state: RunState, inner: R) -> RleDecoder<R> {
-        RleDecoder { inner, state }
-    }
-
-    /// Returns the current state of this decoder.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::io::empty;
-    /// use binhex::rle::read::{RunState, RleDecoder};
-    ///
-    /// // maybe some data was already read from the reader
-    /// let decoder = RleDecoder::with_state(RunState::In(0x41, 4), empty());
-    /// assert_eq!(decoder.state(), RunState::In(0x41, 4));
-    /// ```
-    pub fn state(&self) -> RunState {
-        self.state
-    }
-
-    /// Gets a imutable reference to the underlying reader.
-    ///
-    /// It is inadvisable to directly read from the underlying reader because doing so might result in corrupted data when reading from the decoder.
+    /// It is inadvisable to directly read from the underlying reader because doing
+    /// so might result in corrupted data when reading from this reader.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::io::{empty, Empty};
-    /// use binhex::rle::read::RleDecoder;
+    /// use binhex::rle::Reader;
     ///
-    /// let decoder = RleDecoder::new(empty());
+    /// let decoder = Reader::new(empty());
     /// let reader: &Empty = decoder.get_ref();
     /// ```
     pub fn get_ref(&self) -> &R {
@@ -197,31 +362,32 @@ impl<R> RleDecoder<R> {
 
     /// Gets a mutable reference to the underlying reader.
     ///
-    /// It is inadvisable to directly read from the underlying reader, see [`RleDecoder::get_ref`].
+    /// It is inadvisable to directly read from the underlying reader, see [`Reader::get_ref`].
     ///
     /// # Examples
     ///
     /// ```
     /// use std::io::{empty, Empty};
-    /// use binhex::rle::read::RleDecoder;
+    /// use binhex::rle::Reader;
     ///
-    /// let mut decoder = RleDecoder::new(empty());
+    /// let mut decoder = Reader::new(empty());
     /// let mut reader: &mut Empty = decoder.get_mut();
     /// ```
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.inner
     }
 
-    /// Unwrap this `RleDecoder<R>` and return the underlying reader.
+    /// Unwrap this [`Reader<R>`] and return the underlying reader.
     ///
     /// Note that data stored in the current state is lost.
+    ///
     /// # Examples
     ///
     /// ```
     /// use std::io::{empty, Empty};
-    /// use binhex::rle::read::RleDecoder;
+    /// use binhex::rle::Reader;
     ///
-    /// let decoder = RleDecoder::new(empty());
+    /// let decoder = Reader::new(empty());
     /// let reader: Empty = decoder.into_inner();
     /// ```
     pub fn into_inner(self) -> R {
@@ -229,83 +395,35 @@ impl<R> RleDecoder<R> {
     }
 }
 
-impl<R: Read> RleDecoder<R> {
-    /// Read a single byte from the underlying reader.
-    ///
-    /// If this method returns `None` then nothing could be read.
-    fn read_byte(&mut self) -> Option<IoResult<u8>> {
-        let mut buf = 0;
-        match self.inner.read(slice::from_mut(&mut buf)) {
-            Ok(0) => None,
-            Ok(_) => Some(Ok(buf)),
-            Err(e) => Some(Err(e))
+impl<R: BufRead> Read for Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        if self.eof_reached {
+            let written = self
+                .decoder
+                .drain(buf)
+                .map_err(|_| IoError::from(ErrorKind::UnexpectedEof))?;
+            return Ok(written);
         }
-    }
-
-    /// Update the current state depending of the success of a write and return the number of bytes written.
-    fn update_from_write(&mut self, byte: u8, count: u8, buf: &mut [u8]) -> usize {
-        let (length, state) = RunState::from_write(byte, count, buf);
-        self.state = state;
-        length
-    }
-
-    /// Handle reading beginning with the length.
-    fn read_length(&mut self, byte: u8, buf: &mut [u8]) -> IoResult<usize> {
-        self.read_byte()
-            .unwrap_or_else(|| Err(ErrorKind::UnexpectedEof.into()))
-            .map(|count| self.update_from_write(byte, count, buf))
-    }
-
-    /// Handle reading beginning with the delimiter.
-    fn read_delimiter(&mut self, byte: u8, buf: &mut [u8]) -> IoResult<usize> {
-        if buf.is_empty() {
-            // dont read if the buf cant handle the possible byte
-            Ok(0)
-        } else {
-            match self.read_byte() {
-                // try to complete the run
-                Some(Ok(RUN_DELIMITER)) => {
-                    // remember that we already read the delimiter
-                    self.state = RunState::Length(byte);
-                    self.read_length(byte, buf)
-                }
-                // byte was not part of a run
-                Some(Ok(b)) => {
-                    // does not panic because the if protects against an empty buf
-                    buf[0] = byte;
-                    self.state = RunState::Delimiter(b);
-                    Ok(1)
-                },
-                Some(Err(e)) => Err(e),
-                // if the last run contains no delimiter then its byte is not part of a `real` run
-                None => {
-                    // does not panic because the if protects against an empty buf
-                    buf[0] = byte;
-                    self.state = RunState::Before;
-                    Ok(1)
+        loop {
+            let input = self.inner.fill_buf()?;
+            if input.is_empty() {
+                // consumed all input, drain decoder to prevent returning Ok(0) prematurely
+                self.eof_reached = true;
+                let written = self
+                    .decoder
+                    .drain(buf)
+                    .map_err(|_| IoError::from(ErrorKind::UnexpectedEof))?;
+                return Ok(written);
+            } else {
+                let (read, written) = self.decoder.decode(input, buf);
+                self.inner.consume(read);
+                // try to continue filling the buffer until we either write something
+                // (if possible) or an error occurs, in which case no data is lost
+                // since it will all be stored in the decoder
+                if written != 0 || buf.is_empty() {
+                    return Ok(written);
                 }
             }
-        }
-    }
-}
-
-impl<R: Read> Read for RleDecoder<R> {
-    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        match self.state {
-            // return Ok(0) instead of UnexpectedEof
-            RunState::Before => self.read_byte().map_or(Ok(0), |result| {
-                match result {
-                    Ok(byte) => {
-                        // remember that we already read the first byte of the run
-                        self.state = RunState::Delimiter(byte);
-                        self.read_delimiter(byte, buf)
-                    },
-                    Err(e) => Err(e),
-                }
-            }),
-            RunState::Delimiter(byte) => self.read_delimiter(byte, buf),
-            RunState::Length(byte) => self.read_length(byte, buf),
-            RunState::In(byte, count) => Ok(self.update_from_write(byte, count, buf))
         }
     }
 }

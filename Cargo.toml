@@ -25,3 +25,7 @@ categories = [
 name = "binhex"
 path = "src/lib.rs"
 crate-type = ["lib"]
+
+[dependencies]
+thiserror = { version = "2", default-features = false  }
+memchr = { version = "2", features = ["std"], default-features = false }

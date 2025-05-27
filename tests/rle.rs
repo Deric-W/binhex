@@ -1,7 +1,6 @@
+use binhex::rle::{decode, write, Decoder, Reader, RUN_DELIMITER};
 use core::num::NonZeroU8;
-use std::io::{Result as IoResult, Read, Write};
-use binhex::rle::{read, write, RUN_DELIMITER};
-
+use std::io::{BufRead, Read, Result as IoResult, Write};
 
 /// Writer which always consumes a specified number of bytes
 struct BrokenWriter {
@@ -24,14 +23,107 @@ impl Write for BrokenWriter {
     }
 }
 
+/// Reader which provides its output one byte at a time.
+struct ShortReader<'a> {
+    output: &'a [u8],
+}
 
-/// Check if the decoder handles zero length buffers
+impl<'a> ShortReader<'a> {
+    fn new(output: &'a [u8]) -> Self {
+        ShortReader { output }
+    }
+}
+
+impl<'a> Read for ShortReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        match self.output {
+            [first, rest @ ..] if !buf.is_empty() => {
+                buf[0] = *first;
+                self.output = rest;
+                Ok(1)
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
+impl<'a> BufRead for ShortReader<'a> {
+    fn fill_buf(&mut self) -> IoResult<&[u8]> {
+        let produced = core::cmp::min(1, self.output.len());
+        Ok(&self.output[..produced])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.output = &self.output[amount..];
+    }
+}
+
+/// Check if [`Decoder`] handles zero length buffers.
 #[test]
-fn read_delimiter_zero() {
-    let buffer: [u8; 3] = [RUN_DELIMITER, 2, 3];
-    let mut decoder = read::RleDecoder::with_state(read::RunState::Delimiter(1), &buffer[..]);
-    assert_eq!(decoder.read(&mut []).unwrap(), 0);
-    assert_eq!(decoder.into_inner(), &buffer[..]);
+fn decode_zero_output() {
+    let input: [u8; 4] = [1, RUN_DELIMITER, 2, 3];
+    let mut decoder = Decoder::new();
+
+    assert_eq!(decoder.decode(&input, &mut []), (3, 0));
+    assert_eq!(decoder.decode(&input[3..], &mut []), (0, 0));
+    assert_eq!(decoder.decode(&input[3..], &mut []), (0, 0));
+
+    let mut output = [42; 4];
+
+    assert_eq!(decoder.decode(&input[3..], &mut output), (1, 2));
+    assert_eq!(decoder.drain(&mut []).unwrap(), 0);
+    assert_eq!(decoder.drain(&mut output[2..]).unwrap(), 1);
+    assert_eq!(decoder.drain(&mut output[3..]).unwrap(), 0);
+
+    assert_eq!(output, [1, 1, 3, 42]);
+}
+
+/// CHeck if [`Decoder`] does correctly handle escaped bytes.
+#[test]
+fn decode_excaped_bytes() {
+    let input: [u8; 12] = [
+        RUN_DELIMITER,
+        RUN_DELIMITER,
+        2,
+        RUN_DELIMITER,
+        RUN_DELIMITER,
+        0,
+        RUN_DELIMITER,
+        3,
+        RUN_DELIMITER,
+        RUN_DELIMITER,
+        1,
+        RUN_DELIMITER,
+    ];
+
+    let output = decode(&input).unwrap();
+    assert_eq!(output, [RUN_DELIMITER; 8]);
+}
+
+/// Check if [`Reader::read`] does not produce `Ok(0)` prematurely.
+#[test]
+fn reader_drain_decoder() {
+    let mut reader = Reader::new(ShortReader::new(&[1, RUN_DELIMITER, 2, 3]));
+    let mut buf = Vec::with_capacity(3);
+
+    assert_eq!(reader.read_to_end(&mut buf).unwrap(), 3);
+    assert_eq!(buf, [1, 1, 3]);
+}
+
+/// Check if [`Reader::read`] handles an empty output buffer.
+#[test]
+fn reader_handle_empty_buffer() {
+    let mut reader = Reader::new([1, RUN_DELIMITER, 2, 3].as_slice());
+    let mut output: [u8; 4] = [42; 4];
+
+    assert_eq!(reader.read(&mut []).unwrap(), 0);
+    assert_eq!(reader.read(&mut output[..1]).unwrap(), 1);
+    assert_eq!(reader.read(&mut []).unwrap(), 0);
+    assert_eq!(reader.read(&mut output[1..2]).unwrap(), 1);
+    assert_eq!(reader.read(&mut []).unwrap(), 0);
+    assert_eq!(reader.read(&mut output[2..]).unwrap(), 1);
+
+    assert_eq!(output, [1, 1, 3, 42]);
 }
 
 /// Check if the encoder prevents overflows
