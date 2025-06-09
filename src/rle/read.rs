@@ -21,25 +21,29 @@ use std::collections::TryReserveError;
 use std::io::{BufRead, Error as IoError, ErrorKind, Read, Result as IoResult};
 use thiserror::Error;
 
-/// Error produced by [`Decoder::drain`] when the internal state would require
-/// consuming more bytes.
+/// Error produced by [`Decoder`] when receiving invalid data.
 #[derive(Error, Debug)]
-#[error("expected byte specifying the length of a run, received eof")]
-pub struct DecoderError;
+pub enum DecoderError {
+    #[error("non-zero run without a byte at start")]
+    OrphanedRun,
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Default, Debug)]
+    #[error("expected byte specifying the length of a run, received eof")]
+    UnexpectedEof,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
 enum DecoderState {
-    /// The decoder has not read any data.
+    /// The decoder has not produced any data yet.
     #[default]
     Empty,
 
-    // A byte belonging to a possible run has been read.
-    Byte(u8),
+    /// The decoder produced some data, with its last byte being recorded.
+    Written(u8),
 
-    /// A byte with a run delimiter was read.
-    Delimiter(u8),
+    /// The decoder received a delimiter (possibly after producing some data).
+    Delimiter(Option<u8>),
 
-    /// A run consisting of byte, delimiter and length was read.
+    /// A run  with a non zero length is being produced.
     Run(u8, NonZeroU8),
 }
 
@@ -60,8 +64,8 @@ enum DecoderState {
 ///
 /// [`Decoder`] maintains an internal fixed size buffer for storing state between
 /// calls to its methods.
-/// While this buffer consists only of three bytes it may represent output up to
-/// 256 bytes long and therefore has to be consumed by calling [`Decoder::drain`]
+/// While this buffer consists only of around three bytes it may represent output up
+/// to 255 bytes long and therefore has to be consumed by calling [`Decoder::drain`]
 /// for guaranteeing a successful decoding.
 #[derive(Clone, Default, Debug)]
 pub struct Decoder {
@@ -91,50 +95,69 @@ impl Decoder {
     /// Should the whole decoded output not fit in the output buffer it will only consume
     /// a part of it and expects the caller to call it again with the rest of the input
     /// buffer (and possible more input data) until the whole input has been consumed.
-    pub fn decode(&mut self, mut input: &[u8], mut output: &mut [u8]) -> (usize, usize) {
+    ///
+    /// Should the input begin with a run which is not an escaped delimiter an [`DecoderError`]
+    /// will be produced instead without changing the internal state.
+    pub fn decode(
+        &mut self,
+        mut input: &[u8],
+        mut output: &mut [u8],
+    ) -> Result<(usize, usize), DecoderError> {
         let input_length = input.len();
         let output_length = output.len();
+        let mut state = self.state;
         loop {
-            match self.state {
-                DecoderState::Empty if input.is_empty() => break,
-                DecoderState::Empty => {
-                    self.state = DecoderState::Byte(input[0]);
-                    input = &input[1..];
-                }
-                DecoderState::Byte(byte) if !input.is_empty() && !output.is_empty() => {
-                    let (read, written) = self.read_run(byte, input, output);
-                    input = &input[read..];
-                    output = &mut output[written..];
-                }
-                DecoderState::Byte(byte) => {
-                    self.state = match input.first() {
-                        Some(&RUN_DELIMITER) => DecoderState::Delimiter(byte),
-                        _ => break,
-                    };
-                    input = &input[1..];
-                }
-                DecoderState::Delimiter(_) if input.is_empty() => break,
-                DecoderState::Delimiter(byte) => {
-                    self.state = match NonZeroU8::new(input[0]) {
-                        Some(length) => DecoderState::Run(byte, length),
-                        // a run with a length of zero is an escaped run delimiter byte
-                        None if !output.is_empty() => {
-                            output[0] = byte;
-                            output = &mut output[1..];
-                            DecoderState::Byte(RUN_DELIMITER)
-                        }
-                        None => break,
-                    };
-                    input = &input[1..];
-                }
+            match state {
+                DecoderState::Empty => match input {
+                    [RUN_DELIMITER, rest @ ..] => {
+                        state = DecoderState::Delimiter(None);
+                        input = rest;
+                    }
+                    [byte, rest @ ..] if !output.is_empty() => {
+                        output[0] = *byte;
+                        state = DecoderState::Written(*byte);
+                        input = rest;
+                        output = &mut output[1..];
+                    }
+                    _ => break,
+                },
+                DecoderState::Written(byte) => match read_run(byte, input, output) {
+                    Some((new_state, read, written)) => {
+                        state = new_state;
+                        input = &input[read..];
+                        output = &mut output[written..];
+                    }
+                    None => break,
+                },
+                DecoderState::Delimiter(written) => match input {
+                    [length, rest @ ..] if *length > 0 => {
+                        let written = written.ok_or(DecoderError::OrphanedRun)?;
+                        // first byte already written, subtract it
+                        state = match NonZeroU8::new(length - 1) {
+                            Some(new_length) => DecoderState::Run(written, new_length),
+                            None => DecoderState::Written(written),
+                        };
+                        input = rest;
+                    }
+                    // a run with a length of zero is an escaped run delimiter byte
+                    [0, rest @ ..] if !output.is_empty() => {
+                        output[0] = RUN_DELIMITER;
+                        state = DecoderState::Written(RUN_DELIMITER);
+                        input = rest;
+                        output = &mut output[1..];
+                    }
+                    _ => break,
+                },
                 DecoderState::Run(byte, length) if !output.is_empty() => {
-                    let consumed = self.consume_run(byte, length, output);
+                    let (new_state, consumed) = consume_run(byte, length, output);
+                    state = new_state;
                     output = &mut output[consumed..];
                 }
                 DecoderState::Run(_, _) => break,
             }
         }
-        (input_length - input.len(), output_length - output.len())
+        self.state = state;
+        Ok((input_length - input.len(), output_length - output.len()))
     }
 
     /// Finish decompressing the buffered input.
@@ -149,57 +172,52 @@ impl Decoder {
     /// will be produced instead without changing the internal state.
     pub fn drain(&mut self, output: &mut [u8]) -> Result<usize, DecoderError> {
         match self.state {
-            DecoderState::Empty => Ok(0),
-            DecoderState::Byte(byte) if !output.is_empty() => {
-                output[0] = byte;
-                self.state = DecoderState::Empty;
-                Ok(1)
-            }
-            DecoderState::Byte(_) => Ok(0),
-            DecoderState::Delimiter(_) => Err(DecoderError),
+            DecoderState::Empty | DecoderState::Written(_) => Ok(0),
+            DecoderState::Delimiter(_) => Err(DecoderError::UnexpectedEof),
             DecoderState::Run(byte, length) => {
-                let consumed = self.consume_run(byte, length, output);
+                let (state, consumed) = consume_run(byte, length, output);
+                self.state = state;
                 Ok(consumed)
             }
         }
     }
+}
 
-    /// Read the remainder of a potential run.
-    ///
-    /// Assumes the input and output are not empty.
-    fn read_run(&mut self, byte: u8, input: &[u8], output: &mut [u8]) -> (usize, usize) {
-        debug_assert!(!input.is_empty() && !output.is_empty());
-        let longest_output = min(input.len(), output.len());
-        match memchr(RUN_DELIMITER, &input[..longest_output]) {
-            Some(0) => {
-                self.state = DecoderState::Delimiter(byte);
-                (1, 0)
-            }
-            Some(index) => {
-                output[0] = byte;
-                output[1..index].copy_from_slice(&input[..index - 1]);
-                self.state = DecoderState::Delimiter(input[index - 1]);
-                (index + 1, index)
-            }
-            None => {
-                output[0] = byte;
-                output[1..longest_output].copy_from_slice(&input[..longest_output - 1]);
-                self.state = DecoderState::Byte(input[longest_output - 1]);
-                (longest_output + 1, longest_output)
-            }
+/// Process as much data as possible until a rle run,
+/// returning any progress made.
+fn read_run(written: u8, input: &[u8], output: &mut [u8]) -> Option<(DecoderState, usize, usize)> {
+    // scan one more byte than output to check if it is an delimiter,
+    // stopping at the end of the input
+    let (longest_input, longest_output) = if input.len() > output.len() {
+        (output.len() + 1, output.len())
+    } else {
+        (input.len(), input.len())
+    };
+    match memchr(RUN_DELIMITER, &input[..longest_input]) {
+        Some(0) => Some((DecoderState::Delimiter(Some(written)), 1, 0)),
+        Some(index) => {
+            output[..index].copy_from_slice(&input[..index]);
+            let state = DecoderState::Delimiter(Some(input[index - 1]));
+            Some((state, index + 1, index))
         }
+        None if longest_output > 0 => {
+            output[..longest_output].copy_from_slice(&input[..longest_output]);
+            let state = DecoderState::Written(input[longest_output - 1]);
+            Some((state, longest_output, longest_output))
+        }
+        None => None,
     }
+}
 
-    /// Consume a run of compressed bytes, returning the number of bytes produced.
-    fn consume_run(&mut self, byte: u8, length: NonZeroU8, output: &mut [u8]) -> usize {
-        let consumed: u8 = min(length.get(), output.len().try_into().unwrap_or(u8::MAX));
-        output[..consumed.into()].fill(byte);
-        self.state = match NonZeroU8::new(length.get() - consumed) {
-            Some(new_length) => DecoderState::Run(byte, new_length),
-            None => DecoderState::Empty,
-        };
-        consumed.into()
-    }
+/// Consume a run of compressed bytes, returning the new state and number of bytes produced.
+fn consume_run(byte: u8, length: NonZeroU8, output: &mut [u8]) -> (DecoderState, usize) {
+    let consumed: u8 = min(length.get(), output.len().try_into().unwrap_or(u8::MAX));
+    output[..consumed.into()].fill(byte);
+    let state = match NonZeroU8::new(length.get() - consumed) {
+        Some(new_length) => DecoderState::Run(byte, new_length),
+        None => DecoderState::Written(byte),
+    };
+    (state, consumed.into())
 }
 
 /// Error produced by [`decode`] and [`decode_into`].
@@ -263,7 +281,9 @@ pub fn decode_into(mut input: &[u8], output: &mut Vec<u8>) -> Result<(), DecodeE
         if buf.is_empty() {
             buf = aquire_buf(output)?;
         }
-        let (read, written) = decoder.decode(input, buf);
+        let (read, written) = decoder
+            .decode(input, buf)
+            .map_err(DecodeError::DecoderError)?;
         input = &input[read..];
         buf = &mut buf[written..];
         final_size += written;
@@ -401,7 +421,7 @@ impl<R: BufRead> Read for Reader<R> {
             let written = self
                 .decoder
                 .drain(buf)
-                .map_err(|_| IoError::from(ErrorKind::UnexpectedEof))?;
+                .map_err(|e| IoError::new(ErrorKind::UnexpectedEof, e))?;
             return Ok(written);
         }
         loop {
@@ -412,10 +432,13 @@ impl<R: BufRead> Read for Reader<R> {
                 let written = self
                     .decoder
                     .drain(buf)
-                    .map_err(|_| IoError::from(ErrorKind::UnexpectedEof))?;
+                    .map_err(|e| IoError::new(ErrorKind::UnexpectedEof, e))?;
                 return Ok(written);
             } else {
-                let (read, written) = self.decoder.decode(input, buf);
+                let (read, written) = self
+                    .decoder
+                    .decode(input, buf)
+                    .map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
                 self.inner.consume(read);
                 // try to continue filling the buffer until we either write something
                 // (if possible) or an error occurs, in which case no data is lost

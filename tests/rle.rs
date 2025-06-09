@@ -1,6 +1,30 @@
-use binhex::rle::{decode, write, Decoder, Reader, RUN_DELIMITER};
+use binhex::rle::{decode, write, DecodeError, Decoder, DecoderError, Reader, RUN_DELIMITER};
 use core::num::NonZeroU8;
+use std::fs::read;
 use std::io::{BufRead, Read, Result as IoResult, Write};
+use std::path::PathBuf;
+
+macro_rules! python_binhex_test {
+    ($name:ident: $compressed:literal, $uncompressed: literal) => {
+        /// Test if decompressing a sample produced by Python's binhex module yields the same data.
+        #[test]
+        fn $name() {
+            let sample_diretory: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "rle"]
+                .iter()
+                .collect();
+            let mut compressed_path = sample_diretory.join("compressed");
+            compressed_path.push($compressed);
+            let mut uncompressed_path = sample_diretory.join("uncompressed");
+            uncompressed_path.push($uncompressed);
+            let compressed = read(&compressed_path)
+                .expect(&format!("failed to read {}", compressed_path.display()));
+            let uncompressed = read(&uncompressed_path)
+                .expect(&format!("failed to read {}", uncompressed_path.display()));
+
+            assert_eq!(decode(compressed.as_slice()).unwrap(), uncompressed);
+        }
+    };
+}
 
 /// Writer which always consumes a specified number of bytes
 struct BrokenWriter {
@@ -58,46 +82,79 @@ impl<'a> BufRead for ShortReader<'a> {
     }
 }
 
+python_binhex_test! {
+    decode_python_test_verbose: "test_verbose.bin", "test.bin"
+}
+
+python_binhex_test! {
+    decode_python_test_compact: "test_compact.bin", "test.bin"
+}
+
+python_binhex_test! {
+    decode_python_test_nested_runs: "nested_runs.bin", "nested_runs.bin"
+}
+
 /// Check if [`Decoder`] handles zero length buffers.
 #[test]
 fn decode_zero_output() {
-    let input: [u8; 4] = [1, RUN_DELIMITER, 2, 3];
+    let input: [u8; 6] = [1, RUN_DELIMITER, 2, 3, RUN_DELIMITER, 2];
+    let mut output = [42; 5];
     let mut decoder = Decoder::new();
 
-    assert_eq!(decoder.decode(&input, &mut []), (3, 0));
-    assert_eq!(decoder.decode(&input[3..], &mut []), (0, 0));
-    assert_eq!(decoder.decode(&input[3..], &mut []), (0, 0));
+    assert_eq!(decoder.decode(&input, &mut []).unwrap(), (0, 0));
+    assert_eq!(decoder.decode(&input, &mut output[..1]).unwrap(), (3, 1));
+    assert_eq!(decoder.decode(&input[3..], &mut []).unwrap(), (0, 0));
+    assert_eq!(decoder.decode(&input[3..], &mut []).unwrap(), (0, 0));
 
-    let mut output = [42; 4];
-
-    assert_eq!(decoder.decode(&input[3..], &mut output), (1, 2));
+    assert_eq!(
+        decoder.decode(&input[3..], &mut output[1..3]).unwrap(),
+        (3, 2)
+    );
     assert_eq!(decoder.drain(&mut []).unwrap(), 0);
-    assert_eq!(decoder.drain(&mut output[2..]).unwrap(), 1);
-    assert_eq!(decoder.drain(&mut output[3..]).unwrap(), 0);
+    assert_eq!(decoder.drain(&mut output[3..]).unwrap(), 1);
+    assert_eq!(decoder.drain(&mut output[4..]).unwrap(), 0);
 
-    assert_eq!(output, [1, 1, 3, 42]);
+    assert_eq!(output, [1, 1, 3, 3, 42]);
 }
 
-/// CHeck if [`Decoder`] does correctly handle escaped bytes.
+/// Check if [`Decoder`] does correctly handle escaped bytes.
 #[test]
 fn decode_excaped_bytes() {
-    let input: [u8; 12] = [
-        RUN_DELIMITER,
-        RUN_DELIMITER,
-        2,
-        RUN_DELIMITER,
+    let input: [u8; 8] = [
         RUN_DELIMITER,
         0,
         RUN_DELIMITER,
         3,
         RUN_DELIMITER,
+        3,
         RUN_DELIMITER,
-        1,
-        RUN_DELIMITER,
+        0,
     ];
 
     let output = decode(&input).unwrap();
-    assert_eq!(output, [RUN_DELIMITER; 8]);
+    assert_eq!(output, [RUN_DELIMITER; 6]);
+}
+
+/// Check if [`Decoder`] does report orphaned runs.
+#[test]
+fn test_orphaned_run() {
+    let input: [u8; 2] = [RUN_DELIMITER, 42];
+
+    assert!(matches!(
+        decode(&input).unwrap_err(),
+        DecodeError::DecoderError(DecoderError::OrphanedRun)
+    ));
+}
+
+/// Check if [`Decoder`] does report unexpected eofs.
+#[test]
+fn test_unexpected_eof() {
+    let input: [u8; 2] = [42, RUN_DELIMITER];
+
+    assert!(matches!(
+        decode(&input).unwrap_err(),
+        DecodeError::DecoderError(DecoderError::UnexpectedEof)
+    ));
 }
 
 /// Check if [`Reader::read`] does not produce `Ok(0)` prematurely.
